@@ -15,13 +15,14 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <arpa/inet.h>
 
 static const char *TAG = "TEMP_CALC";
 static bool wifi_connected = false;
 
 // Sleep configurations
-#define DEEP_SLEEP_TIME_SEC 60  // Time to stay in deep sleep
-#define LIGHT_SLEEP_TIME_SEC 30 // Time to stay in light sleep
+#define DEEP_SLEEP_TIME_SEC 10  // Time to stay in deep sleep
+#define LIGHT_SLEEP_TIME_SEC 5 // Time to stay in light sleep
 
 // wifi data
 #define DEVICE_NAME "Group 1"
@@ -30,6 +31,7 @@ static bool wifi_connected = false;
 
 // Data message
 #define DATA_MESSAGE "Temperature measurement"
+#define SERVER_IP_ADDR "138.232.18.37"
 
 // Constants
 #define BETA 3976.0
@@ -122,14 +124,6 @@ static void send_data(float temperature)
              timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
              temperature, DATA_MESSAGE);
 
-    // DNS Resolution
-    struct hostent *host = gethostbyname("pbl.permasense.uibk.ac.at");
-    if (!host)
-    {
-        ESP_LOGE(TAG, "DNS resolution failed");
-        return;
-    }
-
     // Create and configure socket
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0)
@@ -142,11 +136,11 @@ static void send_data(float temperature)
     struct sockaddr_in server_addr = {
         .sin_family = AF_INET,
         .sin_port = htons(22504),
-        .sin_addr = *((struct in_addr *)host->h_addr)};
+        .sin_addr.s_addr = inet_addr(SERVER_IP_ADDR)};
 
     if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
     {
-        ESP_LOGE(TAG, "Connection failed");
+        ESP_LOGE(TAG, "Connection failed: %d", errno);
         close(sock);
         return;
     }
@@ -257,10 +251,10 @@ void app_main(void)
             // Choose your preferred sleep mode:
 
             // Option 1: Deep sleep (WiFi disconnects, full reboot on wake)
-            enter_deep_sleep();
+            // enter_deep_sleep();
 
             // Option 2: Light sleep (maintains WiFi, faster wake-up)
-            // enter_light_sleep();
+            enter_light_sleep();
         }
         else
         {
