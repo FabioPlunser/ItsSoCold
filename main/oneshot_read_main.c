@@ -9,6 +9,7 @@
 #include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_sleep.h"
+#include "esp_task_wdt.h"
 #include "driver/rtc_io.h"
 #include <math.h>
 #include <time.h>
@@ -21,10 +22,13 @@ static const char *TAG = "TEMP_CALC";
 static bool wifi_connected = false;
 
 // Sleep configurations
-#define DEEP_SLEEP_TIME_SEC 10  // Time to stay in deep sleep
+#define DEEP_SLEEP_TIME_SEC 10 // Time to stay in deep sleep
 #define LIGHT_SLEEP_TIME_SEC 5 // Time to stay in light sleep
 
-// wifi data
+// Wifi data
+#define WATCHDOG_TIMEOUT_SEC 30
+#define WIFI_CONNECT_TIMEOUT_MS 10000
+#define WIFI_MAXIMUM_RETRY 5
 #define DEVICE_NAME "Group 1"
 #define WIFI_SSID "SSID"
 #define WIFI_PASS "Pass"
@@ -43,31 +47,20 @@ static bool wifi_connected = false;
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
-    static int retry_count = 0;
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
     {
-        ESP_LOGI(TAG, "WIFI_EVENT_STA_START - Attempting to connect");
         esp_wifi_connect();
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
-        if (retry_count++ < 10)
-        {
-            ESP_LOGI(TAG, "Retry %d/10 to connect to the AP", retry_count);
-            esp_wifi_connect();
-        }
-        else
-        {
-            ESP_LOGE(TAG, "Failed to connect after 10 attempts");
-        }
+        ESP_LOGI(TAG, "Connection failed, retrying...");
+        esp_wifi_connect();
+        wifi_connected = false;
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
     {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        char ip_str[16];
-        esp_ip4addr_ntoa(&event->ip_info.ip, ip_str, sizeof(ip_str));
-        ESP_LOGI(TAG, "Connected! IP: %s", ip_str);
-        retry_count = 0;
+        wifi_connected = true;
+        ESP_LOGI(TAG, "Connected to WiFi network");
     }
 }
 static void wifi_init(void)
@@ -103,8 +96,36 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    int retry_count = 0;
+    uint32_t start_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-    ESP_LOGI(TAG, "wifi_init finished. Connecting...");
+    while (!wifi_connected &&
+           ((xTaskGetTickCount() * portTICK_PERIOD_MS) - start_time) < WIFI_CONNECT_TIMEOUT_MS)
+    {
+        esp_task_wdt_reset(); // Reset watchdog
+
+        if (retry_count >= WIFI_MAXIMUM_RETRY)
+        {
+            ESP_LOGE(TAG, "WiFi connection failed after maximum retries");
+            return;
+        }
+
+        ESP_LOGI(TAG, "Connecting to WiFi... (attempt %d/%d)",
+                 retry_count + 1, WIFI_MAXIMUM_RETRY);
+
+        vTaskDelay(pdMS_TO_TICKS(1000)); // Allow other tasks to run
+        esp_task_wdt_reset();            // Reset watchdog again
+
+        retry_count++;
+    }
+    if (!wifi_connected)
+    {
+        ESP_LOGE(TAG, "WiFi connection timeout");
+        wifi_connected = false;
+        return;
+    }
+
+    ESP_LOGI(TAG, "WiFi connected successfully");
     wifi_connected = true;
 }
 
@@ -220,6 +241,19 @@ static esp_err_t measure_and_send(adc_oneshot_unit_handle_t adc1_handle)
 
 void app_main(void)
 {
+    // Initialize watchdog first
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = WATCHDOG_TIMEOUT_SEC * 1000,
+        .idle_core_mask = 0,
+        .trigger_panic = true};
+    // Delete existing watchdog if any
+    if (esp_task_wdt_deinit() == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Previous watchdog deinitialized");
+    }
+
+    ESP_ERROR_CHECK(esp_task_wdt_init(&wdt_config));
+    ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
     // Initialize Wi-Fi
     wifi_init();
 
@@ -239,22 +273,26 @@ void app_main(void)
 
     while (1)
     {
+        esp_task_wdt_reset(); // Reset watchdog in main loop
+
         if (!wifi_connected)
         {
             wifi_init();
         }
-        // Take measurement and send data
+
         esp_err_t result = measure_and_send(adc1_handle);
+        esp_task_wdt_reset(); // Reset after measurement
 
         if (result == ESP_OK)
         {
-            // Choose your preferred sleep mode:
+            esp_task_wdt_delete(NULL); // Remove watchdog before sleep
 
             // Option 1: Deep sleep (WiFi disconnects, full reboot on wake)
             // enter_deep_sleep();
 
             // Option 2: Light sleep (maintains WiFi, faster wake-up)
             enter_light_sleep();
+            ESP_ERROR_CHECK(esp_task_wdt_add(NULL)); // Re-add watchdog after wake
         }
         else
         {
