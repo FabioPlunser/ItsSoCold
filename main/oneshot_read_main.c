@@ -6,9 +6,13 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "nvs_flash.h"
-#include <math.h>
 #include "esp_netif.h"
 #include "esp_system.h"
+#include <math.h>
+#include <time.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <netdb.h>
 
 static const char *TAG = "TEMP_CALC";
 
@@ -17,23 +21,38 @@ static const char *TAG = "TEMP_CALC";
 #define R2 10000.0
 #define T2 298.15
 #define VREF 3.3
-#define SERIES_RESISTOR 10000.0
+#define SERIES_RESISTOR 27000.0
 
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,
-                               int32_t event_id, void* event_data)
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
 {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+    static int retry_count = 0;
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+    {
+        ESP_LOGI(TAG, "WIFI_EVENT_STA_START - Attempting to connect");
         esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        esp_wifi_connect();
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+    {
+        if (retry_count++ < 10)
+        {
+            ESP_LOGI(TAG, "Retry %d/10 to connect to the AP", retry_count);
+            esp_wifi_connect();
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Failed to connect after 10 attempts");
+        }
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+    {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         char ip_str[16];
         esp_ip4addr_ntoa(&event->ip_info.ip, ip_str, sizeof(ip_str));
-        ESP_LOGI(TAG, "Got IP: %s", ip_str);
+        ESP_LOGI(TAG, "Connected! IP: %s", ip_str);
+        retry_count = 0;
     }
 }
-
 static void wifi_init(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -58,14 +77,76 @@ static void wifi_init(void)
 
     wifi_config_t wifi_config = {
         .sta = {
-            .ssid = "lpsd",
-            .password = "lpsd2024",
+            .ssid = "Fairphone",
+            .password = "ruvk1524",
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
         },
     };
+    ESP_LOGI(TAG, "Setting WiFi configuration SSID %s...", wifi_config.sta.ssid);
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "Wi-Fi initialized");
+
+    ESP_LOGI(TAG, "wifi_init finished. Connecting...");
+}
+
+static void send_data(float temperature)
+{
+    // Format data string (simpler version)
+    char post_data[128];
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    
+    // Format: YYYY-MM-DD HH:MM:SS+0000,GROUP_ID,TEMPERATURE,COMMENT
+    snprintf(post_data, sizeof(post_data), 
+             "%04d-%02d-%02d %02d:%02d:%02d+0000,1,%.4f,yes it works\n",
+             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
+             temperature);
+
+    // DNS Resolution
+    struct hostent *host = gethostbyname("pbl.permasense.uibk.ac.at");
+    if (!host)
+    {
+        ESP_LOGE(TAG, "DNS resolution failed");
+        return;
+    }
+
+    // Create and configure socket
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0)
+    {
+        ESP_LOGE(TAG, "Socket creation error");
+        return;
+    }
+
+    // Connect
+    struct sockaddr_in server_addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(22504),
+        .sin_addr = *((struct in_addr *)host->h_addr)
+    };
+
+    if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
+    {
+        ESP_LOGE(TAG, "Connection failed");
+        close(sock);
+        return;
+    }
+
+    // Send data
+    if (send(sock, post_data, strlen(post_data), 0) < 0)
+    {
+        ESP_LOGE(TAG, "Send failed");
+    }
+    else
+    {
+        ESP_LOGI(TAG, "Data sent: %s", post_data);
+    }
+
+    close(sock);
 }
 
 void app_main(void)
@@ -105,6 +186,9 @@ void app_main(void)
         ESP_LOGI(TAG, "ADC Raw: %d, Voltage: %.2f V, Resistance: %.2f Ω, Temperature: %.2f °C",
                  adc_raw, v_out, resistance, temperature_celsius);
 
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Delay for 1 second
+        // Send data
+        send_data(temperature_celsius);
+
+        vTaskDelay(pdMS_TO_TICKS(10000)); // Delay for 10 seconds
     }
 }
