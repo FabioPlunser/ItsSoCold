@@ -5,6 +5,7 @@
 #include "esp_wifi.h"
 #include "esp_sntp.h"
 #include "nvs_flash.h"
+#include "esp_timer.h"
 #include "esp_netif.h"
 #include "esp_sleep.h"
 #include <sys/socket.h>
@@ -44,12 +45,15 @@
 #define TAG_PM "power"
 #define TAG_SNTP "time"
 
-#define DEEP_SLEEP_TIME_SEC 60
+#define DEEP_SLEEP_TIME_SEC 30
+#define REQUIRED_MEASUREMENTS 10
+#define MEASUREMENT_WINDOW_SEC 300
+
 #define WATCHDOG_TIMEOUT_SEC 30
 
 #define BUTTON_CALIBRATE GPIO_NUM_23 // Calibration button
 #define BUTTON_START GPIO_NUM_19     // Start measurement button
-#define BUTTON_DEBOUNCE_MS 50        
+#define BUTTON_DEBOUNCE_MS 50
 
 // Calibration data
 RTC_DATA_ATTR static float calibrated_resistor = SERIES_RESISTOR;
@@ -57,6 +61,8 @@ RTC_DATA_ATTR static float calibrated_resistor = SERIES_RESISTOR;
 // Store data in RTC memory to survive deep sleep
 RTC_DATA_ATTR static int boot_count = 0;
 RTC_DATA_ATTR static wifi_config_t stored_wifi_config;
+RTC_DATA_ATTR static int measurement_count = 0;
+RTC_DATA_ATTR static uint64_t first_measurement_time = 0;
 static bool wifi_connected = false;
 
 static void init_buttons(void)
@@ -181,6 +187,7 @@ static void wifi_init(void)
             .ssid = WIFI_SSID,
             .password = WIFI_PASS,
             .threshold.authmode = WIFI_AUTH,
+            .listen_interval = 3,
         },
     };
 
@@ -291,10 +298,22 @@ static esp_err_t send_data(float temperature)
     return ESP_OK;
 }
 
+// Update enter_deep_sleep function
 static void enter_deep_sleep(void)
 {
-    ESP_LOGI(TAG_PM, "Entering deep sleep for %d seconds", DEEP_SLEEP_TIME_SEC);
-    esp_deep_sleep(DEEP_SLEEP_TIME_SEC * 1000000ULL);
+    if (measurement_count >= REQUIRED_MEASUREMENTS)
+    {
+        ESP_LOGI(TAG_PM, "Completed %d measurements. Stopping.", REQUIRED_MEASUREMENTS);
+        measurement_count = 0;
+        first_measurement_time = 0;
+        // Sleep for longer period after completing measurements
+        esp_deep_sleep(MEASUREMENT_WINDOW_SEC * 1000000ULL);
+    }
+    else
+    {
+        ESP_LOGI(TAG_PM, "Entering deep sleep for %d seconds", DEEP_SLEEP_TIME_SEC);
+        esp_deep_sleep(DEEP_SLEEP_TIME_SEC * 1000000ULL);
+    }
 }
 
 // Function to handle measurements and data sending
@@ -332,8 +351,27 @@ static esp_err_t measure_and_send(adc_oneshot_unit_handle_t adc1_handle)
     float temperature_kelvin = BETA / (log(resistance / R2) + (BETA / T2));
     float temperature_celsius = temperature_kelvin - KELVIN_TO_CELSIUS;
 
-    ESP_LOGI(TAG_TEMP, "Temperature: %.2f°C (Resistance: %.2f Ω)",
-             temperature_celsius, resistance);
+    // Track first measurement time
+    if (measurement_count == 0)
+    {
+        first_measurement_time = esp_timer_get_time();
+    }
+
+    // Increment measurement count
+    measurement_count++;
+
+    // Calculate elapsed time in seconds
+    uint64_t elapsed_time = (esp_timer_get_time() - first_measurement_time) / 1000000;
+
+    ESP_LOGI(TAG_TEMP, "Measurement %d/10 (Elapsed: %lld sec)",
+             measurement_count, elapsed_time);
+
+    // Reset counters if measurement window exceeded
+    if (elapsed_time >= MEASUREMENT_WINDOW_SEC)
+    {
+        measurement_count = 0;
+        first_measurement_time = 0;
+    }
 
     return send_data(temperature_celsius);
 }
