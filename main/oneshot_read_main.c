@@ -16,8 +16,8 @@
 #define WIFI_CONNECT_TIMEOUT_MS 10000
 #define WIFI_MAXIMUM_RETRY 5
 #define DEVICE_NAME "Group 1"
-#define WIFI_SSID "Fairphone"
-#define WIFI_PASS "ruvk1524"
+#define WIFI_SSID "lpsd"
+#define WIFI_PASS "lpsd2024"
 #define WIFI_AUTH WIFI_AUTH_WPA2_PSK
 
 // Data message
@@ -49,7 +49,7 @@
 
 #define BUTTON_CALIBRATE GPIO_NUM_23 // Calibration button
 #define BUTTON_START GPIO_NUM_19     // Start measurement button
-#define BUTTON_DEBOUNCE_MS 50        // Debounce time
+#define BUTTON_DEBOUNCE_MS 50        
 
 // Calibration data
 RTC_DATA_ATTR static float calibrated_resistor = SERIES_RESISTOR;
