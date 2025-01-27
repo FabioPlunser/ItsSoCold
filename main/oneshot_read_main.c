@@ -1,7 +1,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
-#include "esp_pm.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_sntp.h"
@@ -9,15 +8,17 @@
 #include "esp_netif.h"
 #include "esp_sleep.h"
 #include <sys/socket.h>
+#include "driver/gpio.h"
 #include "esp_task_wdt.h"
 #include "esp_adc/adc_oneshot.h"
 
 // Wifi data
-#define WIFI_CONNECT_TIMEOUT_MS 5000
-#define WIFI_MAXIMUM_RETRY 10
+#define WIFI_CONNECT_TIMEOUT_MS 10000
+#define WIFI_MAXIMUM_RETRY 5
 #define DEVICE_NAME "Group 1"
-#define WIFI_SSID "lpsd"
-#define WIFI_PASS "lpsd2024"
+#define WIFI_SSID "Fairphone"
+#define WIFI_PASS "ruvk1524"
+#define WIFI_AUTH WIFI_AUTH_WPA2_PSK
 
 // Data message
 #define SNTP_SERVER "pool.ntp.org"
@@ -46,10 +47,52 @@
 #define DEEP_SLEEP_TIME_SEC 60
 #define WATCHDOG_TIMEOUT_SEC 30
 
+#define BUTTON_CALIBRATE GPIO_NUM_23 // Calibration button
+#define BUTTON_START GPIO_NUM_19     // Start measurement button
+#define BUTTON_DEBOUNCE_MS 50        // Debounce time
+
+// Calibration data
+RTC_DATA_ATTR static float calibrated_resistor = SERIES_RESISTOR;
+
 // Store data in RTC memory to survive deep sleep
 RTC_DATA_ATTR static int boot_count = 0;
 RTC_DATA_ATTR static wifi_config_t stored_wifi_config;
 static bool wifi_connected = false;
+
+static void init_buttons(void)
+{
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << BUTTON_CALIBRATE) | (1ULL << BUTTON_START),
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+}
+
+static void calibrate_sensor(adc_oneshot_unit_handle_t adc1_handle)
+{
+    ESP_LOGI(TAG_ADC, "Starting calibration at 0°C...");
+
+    // Take multiple readings
+    int32_t adc_sum = 0;
+    for (int i = 0; i < ADC_SAMPLES * 2; i++)
+    {
+        int raw_value;
+        ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, ADC_CHANNEL_2, &raw_value));
+        adc_sum += raw_value;
+        vTaskDelay(pdMS_TO_TICKS(ADC_SAMPLE_DELAY_MS));
+    }
+
+    float raw_value = (float)adc_sum / (ADC_SAMPLES * 2);
+    float v_out = (raw_value / ADC_MAX_VALUE) * VREF;
+
+    // Calculate new series resistor value for 0°C (273.15K)
+    float r_thermistor = R2 * exp((BETA / 273.15) - (BETA / T2));
+    calibrated_resistor = (r_thermistor * (VREF - v_out)) / v_out;
+
+    ESP_LOGI(TAG_ADC, "Calibration complete. New resistor value: %.2f", calibrated_resistor);
+}
 
 static void initialize_sntp(void)
 {
@@ -100,14 +143,16 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG_WIFI, "Got IP address: " IPSTR, IP2STR(&event->ip_info.ip));
         wifi_connected = true;
+        initialize_sntp();
     }
 }
 
 static void wifi_init(void)
 {
-    if (boot_count == 0)
+    static bool wifi_initialized = false;
+
+    if (!wifi_initialized)
     {
-        // First boot - full initialization
         ESP_ERROR_CHECK(esp_netif_init());
         ESP_ERROR_CHECK(esp_event_loop_create_default());
         esp_netif_t *netif = esp_netif_create_default_wifi_sta();
@@ -116,32 +161,33 @@ static void wifi_init(void)
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
         ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                            ESP_EVENT_ANY_ID,
-                                                            &wifi_event_handler,
-                                                            NULL,
-                                                            NULL));
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                            IP_EVENT_STA_GOT_IP,
-                                                            &wifi_event_handler,
-                                                            NULL,
-                                                            NULL));
+        ESP_ERROR_CHECK(
+            esp_event_handler_instance_register(WIFI_EVENT,
+                                                ESP_EVENT_ANY_ID,
+                                                &wifi_event_handler,
+                                                NULL,
+                                                NULL));
+        ESP_ERROR_CHECK(
+            esp_event_handler_instance_register(IP_EVENT,
+                                                IP_EVENT_STA_GOT_IP,
+                                                &wifi_event_handler,
+                                                NULL,
+                                                NULL));
+        wifi_initialized = true;
     }
 
     wifi_config_t wifi_config = {
         .sta = {
             .ssid = WIFI_SSID,
             .password = WIFI_PASS,
-            .threshold.authmode = WIFI_AUTH_WPA_PSK,
-            .listen_interval = 5,
+            .threshold.authmode = WIFI_AUTH,
         },
     };
 
-    ESP_LOGI(TAG_WIFI, "Setting WiFi configuration SSID %s...", wifi_config.sta.ssid);
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MAX_MODEM));
     ESP_ERROR_CHECK(esp_wifi_start());
+    vTaskDelay(pdMS_TO_TICKS(100));
 
     // Connection attempt loop
     int retry_count = 0;
@@ -154,14 +200,12 @@ static void wifi_init(void)
         if (((xTaskGetTickCount() * portTICK_PERIOD_MS) - start_time) >= WIFI_CONNECT_TIMEOUT_MS)
         {
             ESP_LOGE(TAG_WIFI, "WiFi connection timeout");
-            wifi_connected = false;
             return;
         }
 
         if (retry_count >= WIFI_MAXIMUM_RETRY)
         {
             ESP_LOGE(TAG_WIFI, "WiFi connection failed after maximum retries");
-            wifi_connected = false;
             return;
         }
 
@@ -174,11 +218,10 @@ static void wifi_init(void)
 
     if (wifi_connected)
     {
-        ESP_LOGI(TAG_WIFI, "WiFi connected successfully");
-        initialize_sntp();
-
-        // Store successful config in RTC memory
+        // Store config only on successful connection
         memcpy(&stored_wifi_config, &wifi_config, sizeof(wifi_config_t));
+        boot_count++;
+        ESP_LOGI(TAG_WIFI, "WiFi connected successfully, boot_count: %d", boot_count);
     }
 }
 
@@ -186,11 +229,16 @@ static void wifi_quick_connect(void)
 {
     if (boot_count > 0)
     {
+        ESP_LOGI(TAG_WIFI, "Using stored WiFi config from boot %d", boot_count);
         esp_wifi_set_config(WIFI_IF_STA, &stored_wifi_config);
         esp_wifi_start();
-        return;
     }
-    wifi_init();
+    else
+    {
+        // First boot or previous connection failed
+        ESP_LOGI(TAG_WIFI, "First boot or reconnect needed");
+        wifi_init();
+    }
 }
 
 static esp_err_t send_data(float temperature)
@@ -243,7 +291,6 @@ static esp_err_t send_data(float temperature)
     return ESP_OK;
 }
 
-// Power management functions
 static void enter_deep_sleep(void)
 {
     ESP_LOGI(TAG_PM, "Entering deep sleep for %d seconds", DEEP_SLEEP_TIME_SEC);
@@ -281,7 +328,7 @@ static esp_err_t measure_and_send(adc_oneshot_unit_handle_t adc1_handle)
 
     // Convert to temperature
     float v_out = (raw_value / ADC_MAX_VALUE) * VREF;
-    float resistance = SERIES_RESISTOR * v_out / (VREF - v_out);
+    float resistance = calibrated_resistor * v_out / (VREF - v_out);
     float temperature_kelvin = BETA / (log(resistance / R2) + (BETA / T2));
     float temperature_celsius = temperature_kelvin - KELVIN_TO_CELSIUS;
 
@@ -291,9 +338,8 @@ static esp_err_t measure_and_send(adc_oneshot_unit_handle_t adc1_handle)
     return send_data(temperature_celsius);
 }
 
-void app_main(void)
+static void init_nvs(void)
 {
-    // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
@@ -301,23 +347,24 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+}
 
-    // Configure Power Management
-    esp_pm_config_t pm_config = {
-        .max_freq_mhz = 80,
-        .min_freq_mhz = 5,
-        .light_sleep_enable = true};
-    ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
-
-    // Initialize watchdog
+static void init_watchdog(void)
+{
+    if (esp_task_wdt_deinit() == ESP_OK)
+    {
+        ESP_LOGI(TAG_PM, "Previous watchdog deinitialized");
+    }
     esp_task_wdt_config_t wdt_config = {
         .timeout_ms = WATCHDOG_TIMEOUT_SEC * 1000,
         .idle_core_mask = 0,
         .trigger_panic = true};
     ESP_ERROR_CHECK(esp_task_wdt_init(&wdt_config));
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
+}
 
-    // Initialize ADC
+static adc_oneshot_unit_handle_t init_adc(void)
+{
     adc_oneshot_unit_handle_t adc1_handle;
     adc_oneshot_unit_init_cfg_t init_config1 = {
         .unit_id = ADC_UNIT_1,
@@ -328,34 +375,92 @@ void app_main(void)
         .atten = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_12};
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_2, &config));
+    return adc1_handle;
+}
 
-    // Increment boot count
-    boot_count++;
+static void handle_measurements(adc_oneshot_unit_handle_t adc1_handle)
+{
+    ESP_LOGI(TAG_ADC, "Starting measurement cycle");
+    esp_task_wdt_reset();
+    wifi_quick_connect();
 
-    // Configure modem sleep
-    esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
-
-    while (1)
+    if (wifi_connected)
     {
-        esp_task_wdt_reset();
-
-        esp_wifi_start();
-        if (!wifi_connected)
-        {
-            wifi_quick_connect();
-        }
-
+        ESP_LOGI(TAG_WIFI, "Connected, taking measurement");
+        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MAX_MODEM));
         esp_err_t result = measure_and_send(adc1_handle);
 
         if (result == ESP_OK)
         {
+            ESP_LOGI(TAG_PM, "Measurement successful, entering deep sleep");
             esp_wifi_stop();
             adc_oneshot_del_unit(adc1_handle);
             esp_task_wdt_delete(NULL);
             enter_deep_sleep();
         }
-
-        vTaskDelay(pdMS_TO_TICKS(RETRY_DELAY_MS));
+        else
+        {
+            ESP_LOGE(TAG_ADC, "Measurement failed with error: %d", result);
+        }
         esp_wifi_stop();
+    }
+    else
+    {
+        ESP_LOGE(TAG_WIFI, "WiFi connection failed");
+    }
+    vTaskDelay(pdMS_TO_TICKS(RETRY_DELAY_MS));
+}
+
+void app_main(void)
+{
+    // Initialize components
+    init_nvs();
+    init_watchdog();
+    adc_oneshot_unit_handle_t adc1_handle = init_adc();
+    init_buttons();
+
+    bool start_measurements = false;
+
+    while (1)
+    {
+        // Handle calibration button
+        if (gpio_get_level(BUTTON_CALIBRATE) == 0)
+        {
+            vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
+            if (gpio_get_level(BUTTON_CALIBRATE) == 0)
+            {
+                ESP_LOGI(TAG_ADC, "Calibration button pressed");
+                calibrate_sensor(adc1_handle);
+                while (gpio_get_level(BUTTON_CALIBRATE) == 0)
+                {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
+            }
+        }
+
+        // Handle start button
+        if (gpio_get_level(BUTTON_START) == 0)
+        {
+            vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
+            if (gpio_get_level(BUTTON_START) == 0)
+            {
+                ESP_LOGI(TAG_ADC, "Start button pressed");
+                start_measurements = true;
+                while (gpio_get_level(BUTTON_START) == 0)
+                {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
+            }
+        }
+
+        if (start_measurements)
+        {
+            ESP_LOGI(TAG_ADC, "Starting measurements");
+            handle_measurements(adc1_handle);
+        }
+        else
+        {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
     }
 }
