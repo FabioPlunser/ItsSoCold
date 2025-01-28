@@ -622,11 +622,14 @@
 \AtEndPreamble{
   \hypersetup{
     colorlinks = false,
-    pdfauthor = {\beamer@shortauthor},
-    pdfsubject = {{\inserttitle} - {\insertsubtitle}},
-    pdftitle = {\beamer@shorttitle},
-    bookmarksopen=false,
-    pdfstartview=Fit
+    pdfauthor = {\ifdefempty{\beamer@shortauthor}{Unknown Author}{\beamer@shortauthor}},
+    pdfsubject = {\ifdefempty{\inserttitle}{}\inserttitle\ifdefempty{\insertsubtitle}{}{~-~\insertsubtitle}},
+    pdftitle = {\ifdefempty{\beamer@shorttitle}{Untitled}{\beamer@shorttitle}},
+    bookmarksopen = false,
+    pdfstartview = Fit,
+    pdfcreator = {LaTeX with Beamer class},
+    linkcolor = {.},
+    urlcolor = {.}
   }
 }
 \makeatother

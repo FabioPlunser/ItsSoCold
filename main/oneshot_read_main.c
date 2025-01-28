@@ -325,6 +325,7 @@ static esp_err_t measure_and_send(adc_oneshot_unit_handle_t adc1_handle)
     }
 
     int32_t adc_sum = 0;
+    int32_t real_number_of_samples = 0;
     for (int i = 0; i < ADC_SAMPLES; i++)
     {
         int raw_value;
@@ -339,11 +340,16 @@ static esp_err_t measure_and_send(adc_oneshot_unit_handle_t adc1_handle)
             ESP_LOGE(TAG_ADC, "Invalid ADC reading: %d", raw_value);
             continue;
         }
+        real_number_of_samples++;
         adc_sum += raw_value;
         vTaskDelay(pdMS_TO_TICKS(ADC_SAMPLE_DELAY_MS));
     }
-
-    float raw_value = (float)adc_sum / ADC_SAMPLES;
+    if (real_number_of_samples == 0)
+    {
+        ESP_LOGE(TAG_ADC, "No valid ADC readings");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    float raw_value = (float)adc_sum / real_number_of_samples;
 
     // Convert to temperature
     float v_out = (raw_value / ADC_MAX_VALUE) * VREF;
