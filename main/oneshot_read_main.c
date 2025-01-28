@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include "esp_mac.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_sntp.h"
@@ -14,7 +15,7 @@
 #include "esp_adc/adc_oneshot.h"
 
 // Wifi data
-#define WIFI_CONNECT_TIMEOUT_MS 10000
+#define WIFI_CONNECT_TIMEOUT_MS 100000
 #define WIFI_MAXIMUM_RETRY 5
 #define DEVICE_NAME "Group 1"
 #define WIFI_SSID "lpsd"
@@ -64,6 +65,13 @@ RTC_DATA_ATTR static wifi_config_t stored_wifi_config;
 RTC_DATA_ATTR static int measurement_count = 0;
 RTC_DATA_ATTR static uint64_t first_measurement_time = 0;
 static bool wifi_connected = false;
+
+typedef enum
+{
+    STATE_IDLE,
+    STATE_MEASURING,
+    STATE_SLEEPING
+} system_state_t;
 
 static void init_buttons(void)
 {
@@ -180,6 +188,7 @@ static void wifi_init(void)
                                                 NULL,
                                                 NULL));
         wifi_initialized = true;
+        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
     }
 
     wifi_config_t wifi_config = {
@@ -187,14 +196,17 @@ static void wifi_init(void)
             .ssid = WIFI_SSID,
             .password = WIFI_PASS,
             .threshold.authmode = WIFI_AUTH,
-            .listen_interval = 3,
-        },
-    };
+            .pmf_cfg = {
+                .capable = true,
+                .required = false},
+            .scan_method = WIFI_FAST_SCAN}};
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
     ESP_ERROR_CHECK(esp_wifi_start());
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP_ERROR_CHECK(esp_wifi_connect());
 
     // Connection attempt loop
     int retry_count = 0;
@@ -250,6 +262,25 @@ static void wifi_quick_connect(void)
 
 static esp_err_t send_data(float temperature)
 {
+    if (!wifi_connected)
+    {
+        ESP_LOGE(TAG_WIFI, "WiFi not connected");
+        wifi_connected = false;
+        return ESP_ERR_WIFI_NOT_CONNECT;
+    }
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0)
+    {
+        return ESP_FAIL;
+    }
+
+    struct timeval timeout;
+    timeout.tv_sec = 5;
+    timeout.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
     // Format data string (simpler version)
     char post_data[128];
     time_t now;
@@ -264,15 +295,6 @@ static esp_err_t send_data(float temperature)
              timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
              temperature, DATA_MESSAGE);
 
-    // Create and configure socket
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0)
-    {
-        ESP_LOGE(TAG_WIFI, "Socket creation error");
-        return ESP_FAIL;
-    }
-
-    // Connect
     struct sockaddr_in server_addr = {
         .sin_family = AF_INET,
         .sin_port = htons(22504),
@@ -280,22 +302,14 @@ static esp_err_t send_data(float temperature)
 
     if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
     {
-        ESP_LOGE(TAG_WIFI, "Connection failed: %d", errno);
         close(sock);
         return ESP_ERR_TIMEOUT;
     }
 
-    // Send data
-    if (send(sock, post_data, strlen(post_data), 0) < 0)
-    {
-        ESP_LOGE(TAG_WIFI, "Send failed");
-        close(sock);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-
-    ESP_LOGI(TAG_WIFI, "Data sent: %s", post_data);
+    int sent = send(sock, post_data, strlen(post_data), 0);
     close(sock);
-    return ESP_OK;
+
+    return (sent > 0) ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
 }
 
 // Update enter_deep_sleep function
@@ -303,15 +317,15 @@ static void enter_deep_sleep(void)
 {
     if (measurement_count >= REQUIRED_MEASUREMENTS)
     {
-        ESP_LOGI(TAG_PM, "Completed %d measurements. Stopping.", REQUIRED_MEASUREMENTS);
+        ESP_LOGI(TAG_PM, "Completed %d measurements. Going to extended sleep.", REQUIRED_MEASUREMENTS);
         measurement_count = 0;
         first_measurement_time = 0;
-        // Sleep for longer period after completing measurements
         esp_deep_sleep(MEASUREMENT_WINDOW_SEC * 1000000ULL);
     }
     else
     {
-        ESP_LOGI(TAG_PM, "Entering deep sleep for %d seconds", DEEP_SLEEP_TIME_SEC);
+        ESP_LOGI(TAG_PM, "Measurement %d/%d completed. Short sleep.",
+                 measurement_count, REQUIRED_MEASUREMENTS);
         esp_deep_sleep(DEEP_SLEEP_TIME_SEC * 1000000ULL);
     }
 }
@@ -426,17 +440,18 @@ static void handle_measurements(adc_oneshot_unit_handle_t adc1_handle)
 {
     ESP_LOGI(TAG_ADC, "Starting measurement cycle");
     esp_task_wdt_reset();
+
     wifi_quick_connect();
 
+    // Only set power save mode if WiFi is connected
     if (wifi_connected)
     {
-        ESP_LOGI(TAG_WIFI, "Connected, taking measurement");
-        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MAX_MODEM));
-        esp_err_t result = measure_and_send(adc1_handle);
+        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
 
+        esp_err_t result = measure_and_send(adc1_handle);
         if (result == ESP_OK)
         {
-            ESP_LOGI(TAG_PM, "Measurement successful, entering deep sleep");
+            ESP_LOGI(TAG_PM, "Measurement successful");
             esp_wifi_stop();
             adc_oneshot_del_unit(adc1_handle);
             esp_task_wdt_delete(NULL);
@@ -445,14 +460,15 @@ static void handle_measurements(adc_oneshot_unit_handle_t adc1_handle)
         else
         {
             ESP_LOGE(TAG_ADC, "Measurement failed with error: %d", result);
+            esp_wifi_stop();
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
-        esp_wifi_stop();
     }
     else
     {
-        ESP_LOGE(TAG_WIFI, "WiFi connection failed");
+        ESP_LOGE(TAG_WIFI, "Failed to connect to WiFi");
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    vTaskDelay(pdMS_TO_TICKS(RETRY_DELAY_MS));
 }
 
 void app_main(void)
@@ -463,48 +479,64 @@ void app_main(void)
     adc_oneshot_unit_handle_t adc1_handle = init_adc();
     init_buttons();
 
+    system_state_t current_state = STATE_IDLE;
     bool start_measurements = false;
 
     while (1)
     {
-        // Handle calibration button
-        if (gpio_get_level(BUTTON_CALIBRATE) == 0)
+        esp_task_wdt_reset();
+
+        switch (current_state)
         {
-            vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
+        case STATE_IDLE:
+            // Handle calibration button
             if (gpio_get_level(BUTTON_CALIBRATE) == 0)
             {
-                ESP_LOGI(TAG_ADC, "Calibration button pressed");
-                calibrate_sensor(adc1_handle);
-                while (gpio_get_level(BUTTON_CALIBRATE) == 0)
+                vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
+                if (gpio_get_level(BUTTON_CALIBRATE) == 0)
                 {
-                    vTaskDelay(pdMS_TO_TICKS(10));
+                    calibrate_sensor(adc1_handle);
+                    while (gpio_get_level(BUTTON_CALIBRATE) == 0)
+                        vTaskDelay(pdMS_TO_TICKS(10));
                 }
             }
-        }
 
-        // Handle start button
-        if (gpio_get_level(BUTTON_START) == 0)
-        {
-            vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
+            // Handle start button
             if (gpio_get_level(BUTTON_START) == 0)
             {
-                ESP_LOGI(TAG_ADC, "Start button pressed");
-                start_measurements = true;
-                while (gpio_get_level(BUTTON_START) == 0)
+                vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
+                if (gpio_get_level(BUTTON_START) == 0)
                 {
-                    vTaskDelay(pdMS_TO_TICKS(10));
+                    measurement_count = 0;
+                    first_measurement_time = 0;
+                    start_measurements = true;
+                    current_state = STATE_MEASURING;
+                    while (gpio_get_level(BUTTON_START) == 0)
+                        vTaskDelay(pdMS_TO_TICKS(10));
                 }
             }
-        }
-
-        if (start_measurements)
-        {
-            ESP_LOGI(TAG_ADC, "Starting measurements");
-            handle_measurements(adc1_handle);
-        }
-        else
-        {
             vTaskDelay(pdMS_TO_TICKS(100));
+            break;
+
+        case STATE_MEASURING:
+            if (start_measurements)
+            {
+                handle_measurements(adc1_handle);
+                if (measurement_count >= REQUIRED_MEASUREMENTS)
+                {
+                    current_state = STATE_IDLE;
+                    start_measurements = false;
+                }
+                else
+                {
+                    current_state = STATE_SLEEPING;
+                }
+            }
+            break;
+
+        case STATE_SLEEPING:
+            enter_deep_sleep();
+            break;
         }
     }
 }
