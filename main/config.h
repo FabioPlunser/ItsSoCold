@@ -1,4 +1,3 @@
-// config.h
 #ifndef CONFIG_H
 #define CONFIG_H
 
@@ -6,8 +5,8 @@
 #define WIFI_CONNECT_TIMEOUT_MS 100000
 #define WIFI_MAXIMUM_RETRY 5
 #define DEVICE_NAME "Group 1"
-#define WIFI_SSID "Beste"
-#define WIFI_PASS "PumaTec2612"
+#define WIFI_SSID "SSID"
+#define WIFI_PASS "PASSWORD"
 #define WIFI_AUTH WIFI_AUTH_WPA2_PSK
 
 // Server configurations
