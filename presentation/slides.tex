@@ -45,6 +45,31 @@
     \end{itemize}
   \end{frame}
 
+  \begin{frame}
+    \frametitle{Main Operating Loop}
+      \begin{itemize}
+        \item Three Operating States
+        \begin{itemize}
+          \item IDLE: Waits for user input
+          \begin{itemize}
+            \item Calibrate button: Calibrates thermistor at 0°C
+            \item Start button: Begins measurement cycle
+          \end{itemize}
+          \item MEASURING: Active measurement phase
+          \begin{itemize}
+            \item Takes 5 ADC samples
+            \item Connects to WiFi and syncs time
+            \item Sends data to server
+            \item Prepares for sleep
+          \end{itemize}
+          \item SLEEPING: Power saving phase
+          \begin{itemize}
+            \item 30s sleep between measurements (up to 10)
+            \item 300s sleep after 10 measurements complete
+          \end{itemize}
+        \end{itemize}
+      \end{itemize}
+  \end{frame}
 
 \begin{frame}
   \frametitle{Where is the thermistor?}
